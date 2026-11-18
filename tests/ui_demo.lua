@@ -1,0 +1,23 @@
+-- Abre una pestaña de demo: pista con la instrumental de Nube baja y la voz en 3/4 (fader en -inf, no suena),
+-- Nube Width con un preset, ventana del FX flotante y reproducción en loop. Cerrar con tests/ui_close.lua.
+local ROOT = debug.getinfo(1, "S").source:match("^@(.*)/[^/]*$")
+local AUDIO = os.getenv("NUBE_AUDIO") or (ROOT .. "/signals/inst_voz4.wav")
+reaper.Main_OnCommand(40859, 0)
+reaper.InsertTrackAtIndex(0, false); local tr = reaper.GetTrack(0, 0)
+reaper.GetSetMediaTrackInfo_String(tr, "P_NAME", "Nube Width demo", true)
+reaper.SetMediaTrackInfo_Value(tr, "I_NCHAN", 4)
+reaper.SetMediaTrackInfo_Value(tr, "D_VOL", 0)
+local item = reaper.AddMediaItemToTrack(tr); local take = reaper.AddTakeToMediaItem(item)
+local src = reaper.PCM_Source_CreateFromFile(AUDIO); reaper.SetMediaItemTake_Source(take, src)
+reaper.SetMediaItemInfo_Value(item, "D_LENGTH", reaper.GetMediaSourceLength(src))
+reaper.UpdateArrange()
+local fx = reaper.TrackFX_AddByName(tr, "JS:Nube Width/nube_width.jsfx", false, -1)
+-- el preset llega por archivo (os.getenv lee el entorno de REAPER, no el de quien lanza el script)
+local pf = io.open(ROOT .. "/out/ui_preset.txt"); local preset = pf and tonumber(pf:read("l")) or 1; if pf then pf:close() end
+reaper.TrackFX_SetParam(tr, fx, 14, preset)
+reaper.TrackFX_Show(tr, fx, 3)
+reaper.GetSet_LoopTimeRange(true, true, 0, reaper.GetMediaSourceLength(src), false)
+reaper.SetEditCurPos(tonumber(os.getenv("NUBE_START") or "13"), false, false)
+reaper.GetSetRepeat(1)
+reaper.OnPlayButton()
+local f = io.open(ROOT .. "/out/ui.txt", "w"); f:write("done\n"); f:close()
