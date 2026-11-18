@@ -1,0 +1,5 @@
+tests/out/
+tests/signals/
+*.reapeaks
+__pycache__/
+.DS_Store
