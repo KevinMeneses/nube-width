@@ -1,0 +1,689 @@
+desc:Nube Width - ancho estereo M/S compatible con mono (side sintetico, graves en mono, hueco para la voz, correlacion)
+//tags: stereo width imager widener mid-side mono correlation utility
+//author: Kev Meneses + Claude (Claude Code)
+//license: GPL-3.0-or-later
+//version: 1.0.0
+
+slider1:100<0,300,1>-Ancho (%) (100 = igual)
+slider2:0<0,100,1>-Side sintetico (%)
+slider3:14<2,30,0.1>-Retardo del side (ms)
+slider4:250<80,1000,1:log=300>-Tono del side: pasa-altos (Hz)
+slider5:20<20,500,1:log=120>-Graves en mono hasta (Hz; 20 = apagado)
+slider6:1200<200,6000,1:log=1200>-Hueco: frecuencia (Hz)
+slider7:0<-15,0,0.1>-Hueco: cantidad (dB)
+slider8:0.6<0.2,4,0.01:log=1>-Hueco: ancho (Q)
+slider9:0<-6,6,0.1>-Lados (dB)
+slider10:0<0,1,1{Siempre,Solo cuando hay voz (canales 3/4)}>-Hueco: modo
+slider11:-40<-70,0,0.1>-Umbral de voz (dB)
+slider12:0<0,600,0.01>-Activo desde (s) (antes no hace nada)
+slider13:0<-12,12,0.1>-Salida (dB)
+slider14:0<0,2,1{Normal,Mono (L+R),Solo lados (S)}>-Escuchar
+slider15:0<0,21,1{-,Nube baja - Rhodes (cadena completa),Nube baja - Hook (voz),Pads / acordes anchos,Melodia / lead ancho,Coros y dobles,Voz principal (centrada),808 / bajo (todo mono),Bajo con armonicos anchos,Hi-hats / percusion,Clap / snare,Guitarra / stab (dancehall),Organo (dancehall),Pluck / kalimba,Silbido / flauta,Reverb o delay (retorno),Instrumental: hueco para la voz,Instrumental: hueco solo con voz (3/4),Master: un poco mas ancho,Master: mas angosto,Todo mono,Por defecto}>-Cargar preset
+
+in_pin:Entrada L
+in_pin:Entrada R
+in_pin:Voz L (sidechain)
+in_pin:Voz R (sidechain)
+out_pin:Salida L
+out_pin:Salida R
+
+options:gfx_hz=60 no_meter
+
+@init
+gfx_ext_retina = 1;
+
+BUFN = 16384; buf = 0;                  // anillo del centro (side sintetico)
+cMono = 16400; stMono = 16410;          // graves en mono: coeficientes SVF [g, k, a1, a2, a3] y estados (4)
+SPN = 4096; spM = 17000; spS = 21200;   // anillos para el espectro (centro y lados de salida)
+fftb = 25400; magM = 27600; magS = 28700;
+GN = 4096; gonL = 30000; gonR = 34200;  // goniometro
+hitmem = 38400;
+memset(0, 0, BUFN); memset(stMono, 0, 8);
+
+// ---------------------------------------------------------------- utilidades
+function clamp(x, a, b) ( x < a ? a : x > b ? b : x );
+function db2a(x) ( 10 ^ (x / 20) );
+function nlog(v, a, b) ( log(v / a) / log(b / a) );
+function dlog(n, a, b) ( a * (b / a) ^ n );
+function nlin(v, a, b) ( (v - a) / (b - a) );
+function dlin(n, a, b) ( a + (b - a) * n );
+
+function sset(i, v)
+(
+  i == 1 ? ( slider1 = v; slider_automate(slider1); ) : i == 2 ? ( slider2 = v; slider_automate(slider2); ) :
+  i == 3 ? ( slider3 = v; slider_automate(slider3); ) : i == 4 ? ( slider4 = v; slider_automate(slider4); ) :
+  i == 5 ? ( slider5 = v; slider_automate(slider5); ) : i == 6 ? ( slider6 = v; slider_automate(slider6); ) :
+  i == 7 ? ( slider7 = v; slider_automate(slider7); ) : i == 8 ? ( slider8 = v; slider_automate(slider8); ) :
+  i == 9 ? ( slider9 = v; slider_automate(slider9); ) : i == 10 ? ( slider10 = v; slider_automate(slider10); ) :
+  i == 11 ? ( slider11 = v; slider_automate(slider11); ) : i == 12 ? ( slider12 = v; slider_automate(slider12); ) :
+  i == 13 ? ( slider13 = v; slider_automate(slider13); ) : i == 14 ? ( slider14 = v; slider_automate(slider14); ) :
+  i == 15 ? ( slider15 = v; slider_automate(slider15); );
+);
+
+// ---------------------------------------------------------------- filtros
+// SVF trapezoidal (Simper): deja f_lp, f_bp, f_hp
+function setc(c, f, k) local(g)
+(
+  g = tan($pi * f / srate);
+  c[0] = g; c[1] = k; c[2] = 1 / (1 + g * (g + k)); c[3] = g * c[2]; c[4] = g * c[3];
+);
+function svf(x, c, s) local(v1, v2, v3)
+(
+  v3 = x - s[1];
+  v1 = c[2] * s[0] + c[3] * v3;
+  v2 = s[1] + c[3] * s[0] + c[4] * v3;
+  s[0] = 2 * v1 - s[0]; s[1] = 2 * v2 - s[1];
+  f_lp = v2; f_bp = v1; f_hp = x - c[1] * v1 - v2;
+);
+// pasa-altos Linkwitz-Riley de 4o orden (2 Butterworth de 2o orden): -6 dB en la frecuencia, 24 dB/oct
+function hp4(x, c, s) ( svf(x, c, s); svf(f_hp, c, s + 2); f_hp; );
+
+// campana del centro (RBJ, igual que claude_center_carve): coeficientes por bloque
+function bq(x) instance(z1 z2) local(y)
+(
+  y = b0 * x + z1; z1 = b1 * x - a1 * y + z2; z2 = b2 * x - a2 * y; y;
+);
+function pk_coefs(gdb) local(A, w, c, al, a0)
+(
+  A = 10 ^ (gdb / 40); w = 2 * $pi * slider6 / srate; c = cos(w); al = sin(w) / (2 * slider8);
+  a0 = 1 + al / A;
+  b0 = (1 + al * A) / a0; b1 = -2 * c / a0; b2 = (1 - al * A) / a0; a1 = -2 * c / a0; a2 = (1 - al / A) / a0;
+);
+
+function update_params()
+(
+  k_w = slider1 / 100;                                   // claude_width
+  amt = slider2 / 100;                                   // claude_widener
+  dly = min(floor(slider3 * srate / 1000), BUFN - 1);
+  hpc = exp(-2 * $pi * slider4 / srate);
+  mono_on = slider5 > 20.5;                              // graves en mono
+  mono_on ? setc(cMono, min(slider5, srate * 0.45), 1.41421356);
+  sideg = 10 ^ (slider9 / 20);                           // claude_center_carve
+  ea = exp(-1 / (0.010 * srate)); er = exp(-1 / (0.250 * srate));
+  gsm = exp(-1 / (0.030 * srate));
+  vmode = slider10 == 1;
+  og_t = db2a(slider13);
+  listen = slider14;
+  ma = 1 - exp(-1 / (0.300 * srate));                    // medidores: 300 ms
+);
+
+wpos = 0; hp_x1 = hp_y1 = 0;
+env = 0; gcur = 0;
+update_params();
+og = og_t;
+
+// ---------------------------------------------------------------- presets
+NPRESETS = 21;
+function preset_name(n)
+(
+  n == 1 ? "Nube baja - Rhodes (cadena completa)" :
+  n == 2 ? "Nube baja - Hook (voz)" :
+  n == 3 ? "Pads / acordes anchos" :
+  n == 4 ? "Melodia / lead ancho" :
+  n == 5 ? "Coros y dobles" :
+  n == 6 ? "Voz principal (centrada)" :
+  n == 7 ? "808 / bajo (todo mono)" :
+  n == 8 ? "Bajo con armonicos anchos" :
+  n == 9 ? "Hi-hats / percusion" :
+  n == 10 ? "Clap / snare" :
+  n == 11 ? "Guitarra / stab (dancehall)" :
+  n == 12 ? "Organo (dancehall)" :
+  n == 13 ? "Pluck / kalimba" :
+  n == 14 ? "Silbido / flauta" :
+  n == 15 ? "Reverb o delay (retorno)" :
+  n == 16 ? "Instrumental: hueco para la voz" :
+  n == 17 ? "Instrumental: hueco solo con voz (3/4)" :
+  n == 18 ? "Master: un poco mas ancho" :
+  n == 19 ? "Master: mas angosto" :
+  n == 20 ? "Todo mono" :
+  n == 21 ? "Por defecto" : "";
+);
+// an(ancho, side sintetico, retardo, tono del side, graves en mono)
+function an(w, s, d, h, m) ( sset(1, w); sset(2, s); sset(3, d); sset(4, h); sset(5, m); );
+// hu(frecuencia, cantidad, Q, lados, modo)
+function hu(f, c, q, l, md) ( sset(6, f); sset(7, c); sset(8, q); sset(9, l); sset(10, md); );
+function load_preset(n)
+(
+  an(100, 0, 14, 250, 20); hu(1200, 0, 0.6, 0, 0);
+  sset(11, -40); sset(12, 0); sset(13, 0); sset(14, 0);
+  n == 1 ? ( an(160, 40, 14, 250, 20); hu(1200, -5, 0.6, 1.5, 1); sset(12, 12.8); ) :
+  n == 2 ? ( an(100, 35, 14, 250, 20); ) :
+  n == 3 ? ( an(140, 30, 15, 300, 150); hu(1500, -3, 0.7, 0, 0); ) :
+  n == 4 ? ( an(120, 35, 12, 400, 150); ) :
+  n == 5 ? ( an(150, 0, 14, 250, 200); hu(1200, -4, 0.6, 0, 0); ) :
+  n == 6 ? ( an(80, 0, 14, 250, 200); ) :
+  n == 7 ? ( an(0, 0, 14, 250, 20); ) :
+  n == 8 ? ( an(120, 0, 14, 250, 200); ) :
+  n == 9 ? ( an(120, 30, 9, 1000, 300); ) :
+  n == 10 ? ( an(100, 25, 9, 250, 150); ) :
+  n == 11 ? ( an(100, 35, 14, 300, 150); ) :
+  n == 12 ? ( an(100, 30, 14, 250, 150); ) :
+  n == 13 ? ( an(130, 25, 11, 400, 150); hu(1200, -3, 0.6, 0, 0); ) :
+  n == 14 ? ( an(100, 25, 11, 250, 150); hu(1500, -3, 0.6, 0, 0); ) :
+  n == 15 ? ( an(130, 0, 14, 250, 300); hu(1500, -3, 0.6, 0, 0); ) :
+  n == 16 ? ( an(110, 0, 14, 250, 120); hu(1500, -3, 0.5, 1, 0); ) :
+  n == 17 ? ( an(110, 0, 14, 250, 120); hu(1200, -6, 0.6, 1.5, 1); ) :
+  n == 18 ? ( an(115, 0, 14, 250, 120); ) :
+  n == 19 ? ( an(70, 0, 14, 250, 150); ) :
+  n == 20 ? ( an(0, 0, 14, 250, 20); );
+  upd = 1;
+);
+
+@slider
+slider15 > 0 ? ( _pn = floor(slider15 + 0.5); slider15 = 0; slider_automate(slider15); load_preset(_pn); );
+update_params();
+
+@block
+upd ? ( upd = 0; update_params(); );
+t = play_state ? play_position : 0;
+pk_coefs(gcur);
+
+@sample
+a_inL = spl0; a_inR = spl1;
+m = (spl0 + spl1) * 0.5; s = (spl0 - spl1) * 0.5;
+
+// 1) side sintetico (claude_widener): el centro retrasado y con pasa-altos se suma a los lados
+buf[wpos] = m;
+a_r = wpos - dly; a_r < 0 ? a_r += BUFN;
+a_d = buf[a_r];
+(wpos += 1) >= BUFN ? wpos = 0;
+a_hp = hpc * (hp_y1 + a_d - hp_x1);
+hp_x1 = a_d; hp_y1 = a_hp;
+s += amt * a_hp;
+
+// 2) ancho (claude_width)
+s *= k_w;
+
+// 3) graves en mono: los lados pierden lo de abajo (el centro no se toca, el mono queda igual)
+mono_on ? s = hp4(s, cMono, stMono);
+
+// 4) hueco en el centro + lados (claude_center_carve)
+t >= slider12 ? s *= sideg;
+vmode ? (
+  a_v = (spl2 * spl2 + spl3 * spl3) * 0.5;
+  env = a_v > env ? ea * env + (1 - ea) * a_v : er * env + (1 - er) * a_v;
+  amt_v = min(1, max(0, (10 * log10(env + 0.0000000001) - slider11) / 10));
+) : amt_v = 1;
+t < slider12 ? amt_v = 0;
+t += 1 / srate;
+gcur = gsm * gcur + (1 - gsm) * slider7 * amt_v;
+(gcur != 0 || b0 != 1) ? m = pk.bq(m) : pk.z1 = pk.z2 = 0;
+
+// salida y escucha
+og += (og_t - og) * 0.001;
+m *= og; s *= og;
+listen == 1 ? s = 0 : listen == 2 ? m = 0;
+spl0 = m + s; spl1 = m - s;
+vmode ? ( spl2 = 0; spl3 = 0; );
+
+// medidores: potencias L, R y L*R (entrada y salida), espectro y goniometro
+iLL += (a_inL * a_inL - iLL) * ma; iRR += (a_inR * a_inR - iRR) * ma; iLR += (a_inL * a_inR - iLR) * ma;
+oLL += (spl0 * spl0 - oLL) * ma;   oRR += (spl1 * spl1 - oRR) * ma;   oLR += (spl0 * spl1 - oLR) * ma;
+spM[spw] = m; spS[spw] = s; spw = (spw + 1) & (SPN - 1);
+gonL[gw] = spl0; gonR[gw] = spl1; gw = (gw + 1) & (GN - 1);
+
+@gfx 1000 640
+// ======================================================================= interfaz
+SC = gfx_ext_retina > 1 ? gfx_ext_retina : 1;
+WW = gfx_w; WH = gfx_h;
+
+function fnt(i) (
+  i == 1 ? gfx_setfont(1, "Helvetica Neue", 13 * SC) :
+  i == 2 ? gfx_setfont(2, "Helvetica Neue", 11 * SC) :
+  i == 3 ? gfx_setfont(3, "Helvetica Neue", 17 * SC, 'b') :
+  i == 4 ? gfx_setfont(4, "Helvetica Neue", 10 * SC, 'b') :
+  i == 6 ? gfx_setfont(6, "Helvetica Neue", 15 * SC, 'b') :
+           gfx_setfont(5, "Helvetica Neue", 12 * SC, 'b');
+);
+function acc(a) ( gfx_set(0.38, 0.88, 0.80, a); );       // turquesa: el centro
+function sid(a) ( gfx_set(1.00, 0.66, 0.30, a); );       // naranjo: los lados
+
+function hit_add(x, y, w, h, id) local(p)
+( hit_n < 200 ? ( p = hitmem + hit_n * 5; p[0] = x; p[1] = y; p[2] = w; p[3] = h; p[4] = id; hit_n += 1; ); );
+function hit_find(mx, my) local(i, p, r)
+(
+  r = 0; i = hit_n - 1;
+  while (i >= 0 && r == 0) (
+    p = hitmem + i * 5;
+    (mx >= p[0] && mx < p[0] + p[2] && my >= p[1] && my < p[1] + p[3]) ? r = p[4];
+    i -= 1;
+  );
+  r;
+);
+
+function frect(x, y, w, h, r) (
+  r = min(r, min(w, h) * 0.5);
+  gfx_rect(x + r, y, w - 2 * r, h, 1);
+  gfx_rect(x, y + r, r, h - 2 * r, 1);
+  gfx_rect(x + w - r, y + r, r, h - 2 * r, 1);
+  gfx_circle(x + r, y + r, r, 1, 1); gfx_circle(x + w - r - 1, y + r, r, 1, 1);
+  gfx_circle(x + r, y + h - r - 1, r, 1, 1); gfx_circle(x + w - r - 1, y + h - r - 1, r, 1, 1);
+);
+function text_c(str, x, y, w, h) ( gfx_x = x; gfx_y = y; gfx_drawstr(str, 1 | 4, x + w, y + h); );
+function text_l(str, x, y, h) ( gfx_x = x; gfx_y = y; gfx_drawstr(str, 4, x + 2000, y + h); );
+function text_r(str, x, y, w, h) ( gfx_x = x; gfx_y = y; gfx_drawstr(str, 2 | 4, x + w, y + h); );
+
+function fmt_f(d, f) ( f < 1000 ? sprintf(d, "%d Hz", floor(f + 0.5)) : sprintf(d, f < 10000 ? "%.2f kHz" : "%.1f kHz", f / 1000); );
+
+function dropdown(id, x, y, w, h, label, str)
+(
+  hov = hover_id == id;
+  gfx_set(hov ? 0.24 : 0.17, hov ? 0.26 : 0.19, hov ? 0.31 : 0.24, 1);
+  frect(x, y, w, h, 5 * SC);
+  fnt(2); gfx_set(0.55, 0.58, 0.65, 1);
+  text_l(label, x + 8 * SC, y, h);
+  strlen(label) ? gfx_measurestr(label, _tw, _th) : _tw = -4 * SC;
+  fnt(1); gfx_set(0.90, 0.92, 0.96, 1);
+  text_l(str, x + 12 * SC + _tw, y, h);
+  gfx_set(0.55, 0.58, 0.65, 1);
+  _cx = x + w - 12 * SC; _cy = y + h * 0.5;
+  gfx_triangle(_cx - 4 * SC, _cy - 2 * SC, _cx + 4 * SC, _cy - 2 * SC, _cx, _cy + 3 * SC);
+  hit_add(x, y, w, h, id);
+);
+
+function seg(id, x, y, w, h, str, on)
+(
+  _hv = hover_id == id;
+  on ? acc(1) : gfx_set(_hv ? 0.24 : 0.16, _hv ? 0.26 : 0.18, _hv ? 0.31 : 0.23, 1);
+  frect(x, y, w, h, 5 * SC);
+  fnt(5); on ? gfx_set(0.07, 0.08, 0.10, 1) : gfx_set(0.86, 0.88, 0.92, 1);
+  text_c(str, x, y, w, h);
+  hit_add(x, y, w, h, id);
+);
+
+// bip: 0 = arco desde el minimo, 1 = desde el centro, 2 = desde 1/3 (100 % en el Ancho)
+function knob(id, cx, cy, r, label, str, n, bip, enabled) local(a0, a1, av, i, rr, ac)
+(
+  a0 = -0.75 * $pi; a1 = 0.75 * $pi; av = a0 + (a1 - a0) * clamp(n, 0, 1);
+  fnt(2); gfx_set(0.62, 0.65, 0.72, enabled ? 1 : 0.4);
+  text_c(label, cx - 50 * SC, cy - r - 18 * SC, 100 * SC, 14 * SC);
+  gfx_set(0.13, 0.14, 0.18, 1); gfx_circle(cx, cy, r, 1, 1);
+  gfx_set(0.26, 0.28, 0.34, 1);
+  i = 0; loop(3 * SC, gfx_arc(cx, cy, r - 2 * SC - i, a0, a1, 1); i += 1; );
+  knob_side ? sid(enabled ? 1 : 0.35) : acc(enabled ? 1 : 0.35);
+  ac = bip == 2 ? a0 + (a1 - a0) / 3 : 0;
+  i = 0; loop(3 * SC, rr = r - 2 * SC - i;
+    bip ? ( av < ac ? gfx_arc(cx, cy, rr, av, ac, 1) : gfx_arc(cx, cy, rr, ac, av, 1); )
+        : gfx_arc(cx, cy, rr, a0, av, 1);
+    i += 1; );
+  gfx_set(0.92, 0.93, 0.96, enabled ? 1 : 0.4);
+  gfx_line(cx + sin(av) * r * 0.25, cy - cos(av) * r * 0.25, cx + sin(av) * (r - 6 * SC), cy - cos(av) * (r - 6 * SC), 1);
+  hover_id == id ? ( gfx_set(1, 1, 1, 0.12); gfx_circle(cx, cy, r + 2 * SC, 0, 1); );
+  fnt(1); gfx_set(0.92, 0.93, 0.96, enabled ? 1 : 0.45);
+  text_c(str, cx - 50 * SC, cy + r + 3 * SC, 100 * SC, 16 * SC);
+  hit_add(cx - r - 8 * SC, cy - r - 4 * SC, 2 * r + 16 * SC, 2 * r + 24 * SC, id);
+);
+
+// ---------------------------------------------------------- controles: id = slider -> minimo, maximo, log, defecto, paso
+function ctl_info(id)
+(
+  ci_s = id;
+  id == 1 ? ( ci_a = 0; ci_b = 300; ci_l = 0; ci_d = 100; ci_p = 1; ) :
+  id == 2 ? ( ci_a = 0; ci_b = 100; ci_l = 0; ci_d = 0; ci_p = 1; ) :
+  id == 3 ? ( ci_a = 2; ci_b = 30; ci_l = 0; ci_d = 14; ci_p = 0.1; ) :
+  id == 4 ? ( ci_a = 80; ci_b = 1000; ci_l = 1; ci_d = 250; ci_p = 1; ) :
+  id == 5 ? ( ci_a = 20; ci_b = 500; ci_l = 1; ci_d = 20; ci_p = 1; ) :
+  id == 6 ? ( ci_a = 200; ci_b = 6000; ci_l = 1; ci_d = 1200; ci_p = 1; ) :
+  id == 7 ? ( ci_a = -15; ci_b = 0; ci_l = 0; ci_d = 0; ci_p = 0.1; ) :
+  id == 8 ? ( ci_a = 0.2; ci_b = 4; ci_l = 1; ci_d = 0.6; ci_p = 0.01; ) :
+  id == 9 ? ( ci_a = -6; ci_b = 6; ci_l = 0; ci_d = 0; ci_p = 0.1; ) :
+  id == 11 ? ( ci_a = -70; ci_b = 0; ci_l = 0; ci_d = -40; ci_p = 0.1; ) :
+  id == 13 ? ( ci_a = -12; ci_b = 12; ci_l = 0; ci_d = 0; ci_p = 0.1; ) :
+  ci_s = 0;
+);
+function ctl_get(id) local(v)
+( ctl_info(id); v = slider(ci_s); ci_l ? nlog(v, ci_a, ci_b) : nlin(v, ci_a, ci_b); );
+function ctl_setv(id, v)
+(
+  ctl_info(id);
+  ci_s ? ( v = clamp(floor(v / ci_p + 0.5) * ci_p, ci_a, ci_b); sset(ci_s, v); upd = 1; );
+);
+function ctl_set(id, n) ( ctl_info(id); n = clamp(n, 0, 1); ctl_setv(id, ci_l ? dlog(n, ci_a, ci_b) : dlin(n, ci_a, ci_b)); );
+function ctl_default(id) ( ctl_info(id); ctl_setv(id, ci_d); );
+function is_knob(id) ( (id >= 1 && id <= 9) || id == 11 || id == 13; );
+
+// ---------------------------------------------------------- ayudas
+function hint_for(id)
+(
+  id == 1 ? strcpy(#hint, "Ancho: sube o baja los lados reales (side). 100% = igual, 0% = mono, 150% = bastante mas ancho. El mono no cambia.") :
+  id == 2 ? strcpy(#hint, "Side sintetico: crea lados con una copia retrasada del centro. Abre sonidos mono; en mono se cancela y no cambia nada.") :
+  id == 3 ? strcpy(#hint, "Retardo del side sintetico: 8-12 ms = apretado, 14-20 ms = abierto. Muy largo suena a eco en los lados.") :
+  id == 4 ? strcpy(#hint, "Tono del side sintetico: pasa-altos. Mas alto = el ancho nuevo queda solo en los agudos (no ensucia los graves).") :
+  id == 5 ? strcpy(#hint, "Graves en mono: debajo de esta frecuencia los lados se van (24 dB/oct). 100-150 Hz es lo usual. Todo a la izquierda = apagado.") :
+  id == 6 ? strcpy(#hint, "Hueco: frecuencia de la campana que baja el centro. La voz vive en 1-3 kHz; 1.2-1.5 kHz es un buen comienzo.") :
+  id == 7 ? strcpy(#hint, "Hueco: cuanto baja el centro en esa zona (los lados quedan igual). -3 a -6 dB deja espacio a la voz sin que se note.") :
+  id == 8 ? strcpy(#hint, "Hueco: ancho de la campana (Q). 0.5-0.7 = ancho y suave; mas alto = mas angosto.") :
+  id == 9 ? strcpy(#hint, "Lados: ganancia de los lados (despues del ancho). Sirve para compensar lo que baja el hueco.") :
+  id == 11 ? strcpy(#hint, "Umbral de voz: con la voz por los canales 3/4 sobre este nivel el hueco actua (rampa de 10 dB).") :
+  id == 13 ? strcpy(#hint, "Salida: volumen final.") :
+  id == 30 ? strcpy(#hint, "Presets: puntos de partida, incluida la cadena del Rhodes de Nube baja. Para guardar los tuyos usa el + de REAPER.") :
+  id == 40 ? strcpy(#hint, "Hueco siempre: la campana baja el centro todo el tiempo.") :
+  id == 41 ? strcpy(#hint, "Hueco solo con voz: manda la voz a los canales 3/4 de esta pista; el hueco se abre cuando hay voz.") :
+  id == 50 ? strcpy(#hint, "Escuchar normal.") :
+  id == 51 ? strcpy(#hint, "Escuchar en mono (L+R): asi suena en un parlante de celular o en un club mono. Debe sonar igual de fuerte.") :
+  id == 52 ? strcpy(#hint, "Escuchar solo lados (S): lo que desaparece en mono. Revisa que no queden graves aqui.") :
+  id == 100 ? strcpy(#hint, "Goniometro: vertical = centro, horizontal = lados. Mas redondo = mas ancho. Arrastra arriba/abajo = ancho | clic derecho = presets") :
+  id == 101 ? strcpy(#hint, "Frecuencias: turquesa = centro, naranjo = lados. Arrastra arriba/abajo = ancho | clic derecho = presets") :
+  id == 102 ? strcpy(#hint, "Correlacion de entrada y salida (+1 mono, 0 muy ancho, negativa = se pierde en mono) y lados/centro. Clic = reiniciar.") :
+  id == 110 ? strcpy(#hint, "Hueco: arrastra = frecuencia (izq/der) y cantidad (arriba/abajo) | rueda = ancho (Q) | doble clic = sin hueco") :
+  id == 111 ? strcpy(#hint, "Graves en mono: arrastra izquierda/derecha. Todo a la izquierda = apagado. Doble clic = 120 Hz / apagado.") :
+  id == 112 ? strcpy(#hint, "Tono del side sintetico: arrastra izquierda/derecha. Doble clic = 250 Hz.") :
+  strcpy(#hint, "Nube Width: elige un preset y mira la correlacion. Pasa el mouse sobre cualquier cosa para ver que hace.");
+);
+
+// ---------------------------------------------------------- menus
+function menu_presets() local(r, i)
+(
+  #m = "#PRESETS DE NUBE WIDTH";
+  i = 1; loop(NPRESETS, strcat(#m, "|"); strcat(#m, preset_name(i)); i += 1; );
+  gfx_x = mouse_x; gfx_y = mouse_y;
+  r = gfx_showmenu(#m);
+  r >= 2 ? load_preset(r - 1);
+);
+
+// ======================================================================= layout
+TOPH = 44 * SC; PANH = 150 * SC; FOOTH = 26 * SC;
+dy = TOPH + 10 * SC;
+dh = WH - TOPH - PANH - FOOTH - 20 * SC; dh < 140 * SC ? dh = 140 * SC;
+MW = 120 * SC; mx0 = WW - 14 * SC - MW;
+gsz = min(dh, (WW - MW) * 0.34); gx0 = 14 * SC; gy0 = dy;
+fx0 = gx0 + gsz + 16 * SC; fw = mx0 - 16 * SC - fx0;
+py = dy + dh + 10 * SC;
+FLO = 20; FHI = 20000;
+CTOP = 18; CBOT = -30;
+
+function f2x(f) ( fx0 + fw * clamp(log(f / FLO) / log(FHI / FLO), 0, 1) );
+function x2f(x) ( FLO * (FHI / FLO) ^ clamp((x - fx0) / fw, 0, 1) );
+function c2y(d) ( dy + 18 * SC + (dh - 36 * SC) * clamp((CTOP - d) / (CTOP - CBOT), 0, 1) );
+function y2c(y) ( CTOP - (y - dy - 18 * SC) / (dh - 36 * SC) * (CTOP - CBOT) );
+// |H| de la campana RBJ del hueco (ganancia gdb) en f
+function pk_mag(f, gdb) local(A, w, c, al, a0, nb0, nb1, nb2, na1, na2, wf, nr, ni, dr, di)
+(
+  A = 10 ^ (gdb / 40); w = 2 * $pi * slider6 / srate; c = cos(w); al = sin(w) / (2 * slider8);
+  a0 = 1 + al / A;
+  nb0 = (1 + al * A) / a0; nb1 = -2 * c / a0; nb2 = (1 - al * A) / a0; na1 = -2 * c / a0; na2 = (1 - al / A) / a0;
+  wf = 2 * $pi * min(f, srate * 0.49) / srate;
+  nr = nb0 + nb1 * cos(wf) + nb2 * cos(2 * wf); ni = -nb1 * sin(wf) - nb2 * sin(2 * wf);
+  dr = 1 + na1 * cos(wf) + na2 * cos(2 * wf); di = -na1 * sin(wf) - na2 * sin(2 * wf);
+  sqrt((nr * nr + ni * ni) / (dr * dr + di * di));
+);
+// pasa-altos de 4o orden de los graves en mono = 2 Butterworth de 2o orden (con la deformacion bilineal)
+function mono_mag(f) local(w)
+(
+  slider5 > 20.5 ? ( w = (tan($pi * min(f, srate * 0.49) / srate) / tan($pi * min(slider5, srate * 0.45) / srate)) ^ 2; w * w / ((1 - w) * (1 - w) + 2 * w); ) : 1;
+);
+// pasa-altos de 1er orden del side sintetico
+function syn_mag(f) local(c, wf, nr, ni, dr, di)
+(
+  c = exp(-2 * $pi * slider4 / srate); wf = 2 * $pi * min(f, srate * 0.49) / srate;
+  nr = 1 - cos(wf); ni = sin(wf); dr = 1 - c * cos(wf); di = c * sin(wf);
+  c * sqrt((nr * nr + ni * ni) / (dr * dr + di * di));
+);
+
+// ======================================================================= mouse
+mx = mouse_x; my = mouse_y;
+lb = mouse_cap & 1; rb = mouse_cap & 2; shift = mouse_cap & 8;
+hover_id = drag ? drag_id : hit_find(mx, my);
+
+lb && !last_lb ? (
+  _now = time_precise();
+  dbl = _now - last_t < 0.35 && abs(mx - last_x) < 6 * SC && abs(my - last_y) < 6 * SC;
+  last_t = dbl ? 0 : _now; last_x = mx; last_y = my;
+  is_knob(hover_id) ? (
+    dbl ? ctl_default(hover_id) : ( drag = 1; drag_id = hover_id; drag_my = my; drag_n = ctl_get(hover_id); );
+  ) : (hover_id == 100 || hover_id == 101) ? (
+    dbl ? ctl_default(1) : ( drag = 1; drag_id = hover_id; drag_my = my; drag_n = ctl_get(1); );
+  ) : hover_id == 110 ? (
+    dbl ? ctl_setv(7, 0) : ( drag = 1; drag_id = 110; );
+  ) : hover_id == 111 ? (
+    dbl ? ctl_setv(5, slider5 > 20.5 ? 20 : 120) : ( drag = 1; drag_id = 111; );
+  ) : hover_id == 112 ? (
+    dbl ? ctl_default(4) : ( drag = 1; drag_id = 112; );
+  ) : hover_id == 102 ? ( cmin_in = cmin_out = 1; )
+    : hover_id == 30 ? menu_presets()
+    : (hover_id == 40 || hover_id == 41) ? ( sset(10, hover_id - 40); upd = 1; )
+    : (hover_id >= 50 && hover_id <= 52) ? ( sset(14, hover_id - 50); upd = 1; );
+);
+
+lb && drag ? (
+  _k = shift ? 0.1 : 1;
+  is_knob(drag_id) ? ctl_set(drag_id, drag_n + (drag_my - my) / (220 * SC) * _k) :
+  (drag_id == 100 || drag_id == 101) ? ctl_set(1, drag_n + (drag_my - my) / (300 * SC) * _k) :
+  drag_id == 110 ? ( ctl_setv(6, x2f(mx)); ctl_setv(7, min(y2c(my), 0)); ) :
+  drag_id == 111 ? ( _f = x2f(mx); ctl_setv(5, _f < 25 ? 20 : _f); ) :
+  drag_id == 112 ? ctl_setv(4, x2f(mx));
+);
+!lb ? drag = 0;
+
+rb && !last_rb ? ( (hover_id == 100 || hover_id == 101) ? menu_presets(); );
+
+mouse_wheel != 0 ? (
+  _w = mouse_wheel / 120;
+  is_knob(hover_id) ? ctl_set(hover_id, ctl_get(hover_id) + _w * (shift ? 0.002 : 0.012)) :
+  hover_id == 110 ? ctl_set(8, ctl_get(8) + _w * (shift ? 0.004 : 0.02)) :
+  (hover_id == 100 || hover_id == 101) ? ctl_set(1, ctl_get(1) + _w * (shift ? 0.002 : 0.012));
+  mouse_wheel = 0;
+);
+last_lb = lb; last_rb = rb;
+
+// ======================================================================= medidas
+function corr(LL, RR, LR) ( LL * RR > 0.00000000000001 ? LR / sqrt(LL * RR) : 1; );
+c_in = corr(iLL, iRR, iLR); c_out = corr(oLL, oRR, oLR);
+cmin_in = min(c_in, cmin_in + 0.002); cmin_out = min(c_out, cmin_out + 0.002);
+// lados/centro y "en mono": potencia de (L+R)/2 contra el promedio de L y R (0 dB = mono puro, -3 = sin correlacion)
+function sm_db(LL, RR, LR) ( 10 * log10((LL + RR - 2 * LR + 0.0000000000001) / (LL + RR + 2 * LR + 0.0000000000001)); );
+function mono_db(LL, RR, LR) ( 10 * log10(((LL + RR + 2 * LR) / 4 + 0.0000000000001) / ((LL + RR) / 2 + 0.0000000000001)); );
+quiet = oLL + oRR < 0.0000001;
+
+// ======================================================================= dibujo
+hit_n = 0;
+gfx_set(0.075, 0.082, 0.105, 1); gfx_rect(0, 0, WW, WH, 1);
+
+// ---- barra superior
+gfx_set(0.10, 0.11, 0.14, 1); gfx_rect(0, 0, WW, TOPH, 1);
+fnt(3); gfx_set(0.62, 0.80, 1.0, 1); text_l("NUBE", 14 * SC, 0, TOPH);
+gfx_measurestr("NUBE ", _tw, _th);
+gfx_set(0.93, 0.94, 0.97, 1); text_l("WIDTH", 14 * SC + _tw, 0, TOPH);
+_x = 150 * SC; _y = 9 * SC; _h = 26 * SC;
+dropdown(30, _x, _y, 116 * SC, _h, "", "Presets");
+_x = WW - 14 * SC;
+_x - 420 * SC > 280 * SC ? (
+  fnt(6); _mo = mono_db(oLL, oRR, oLR);
+  quiet ? strcpy(#s, "--") : sprintf(#s, "%.1f dB", _mo);
+  _mo < -3 ? gfx_set(1.0, 0.50, 0.44, 1) : gfx_set(0.93, 0.94, 0.97, 1);
+  text_r(#s, _x - 90 * SC, _y, 90 * SC, _h); _x -= 96 * SC;
+  fnt(2); gfx_set(0.55, 0.58, 0.65, 1); text_r("EN MONO", _x - 70 * SC, _y, 70 * SC, _h); _x -= 90 * SC;
+  fnt(6); quiet ? strcpy(#s, "--") : sprintf(#s, "%+.2f", c_out);
+  c_out < 0 ? gfx_set(1.0, 0.50, 0.44, 1) : c_out < 0.3 ? gfx_set(0.95, 0.85, 0.35, 1) : acc(1);
+  text_r(#s, _x - 70 * SC, _y, 70 * SC, _h); _x -= 76 * SC;
+  fnt(2); gfx_set(0.55, 0.58, 0.65, 1); text_r("CORRELACION", _x - 100 * SC, _y, 100 * SC, _h);
+);
+
+// ---- goniometro
+gfx_set(0.095, 0.105, 0.135, 1); gfx_rect(gx0, gy0, gsz, gsz, 1);
+_cx = gx0 + gsz * 0.5; _cy = gy0 + gsz * 0.5; _rr = gsz * 0.45;
+gfx_set(1, 1, 1, 0.06);
+gfx_line(_cx, gy0 + 6 * SC, _cx, gy0 + gsz - 6 * SC); gfx_line(gx0 + 6 * SC, _cy, gx0 + gsz - 6 * SC, _cy);
+gfx_set(1, 1, 1, 0.035);
+gfx_line(_cx - _rr * 0.7, _cy - _rr * 0.7, _cx + _rr * 0.7, _cy + _rr * 0.7); gfx_line(_cx - _rr * 0.7, _cy + _rr * 0.7, _cx + _rr * 0.7, _cy - _rr * 0.7);
+fnt(4); gfx_set(0.50, 0.53, 0.60, 1);
+text_c("M", _cx - 10 * SC, gy0 + 4 * SC, 20 * SC, 12 * SC);
+text_l("L", gx0 + 8 * SC, gy0 + 4 * SC, 12 * SC); text_r("R", gx0, gy0 + 4 * SC, gsz - 8 * SC, 12 * SC);
+// escala automatica (sigue el pico de los puntos dibujados)
+_pk = 0; _i = 0; loop(1024, _j = (gw - 1 - 2 * _i) & (GN - 1); _pk = max(_pk, max(abs(gonL[_j] + gonR[_j]), abs(gonL[_j] - gonR[_j])) * 0.5); _i += 1; );
+gon_g = max(max(_pk, gon_g * 0.97), 0.003);
+_sc = _rr / gon_g;
+acc(0.55);
+_i = 0;
+loop(1024,
+  _j = (gw - 1 - 2 * _i) & (GN - 1);
+  _px = _cx - (gonL[_j] - gonR[_j]) * 0.5 * _sc; _py = _cy - (gonL[_j] + gonR[_j]) * 0.5 * _sc;
+  _i == 512 ? acc(0.30);
+  gfx_rect(_px, _py, SC, SC, 1);
+  _i += 1;
+);
+fnt(4); gfx_set(0.62, 0.65, 0.72, 1);
+quiet ? strcpy(#s, "") : sprintf(#s, "LADOS / CENTRO  %.1f dB", sm_db(oLL, oRR, oLR));
+text_l(#s, gx0 + 8 * SC, gy0 + gsz - 16 * SC, 12 * SC);
+(hover_id == 100 || (drag && drag_id == 100)) ? ( gfx_set(1, 1, 1, 0.25); gfx_rect(gx0, gy0, gsz, gsz, 0); );
+hit_add(gx0, gy0, gsz, gsz, 100);
+
+// ---- frecuencias
+gfx_set(0.095, 0.105, 0.135, 1); gfx_rect(fx0, dy, fw, dh, 1);
+fnt(4);
+_f = 50;
+loop(6,
+  _xx = f2x(_f); gfx_set(1, 1, 1, 0.05); gfx_line(_xx, dy + 18 * SC, _xx, dy + dh - 1);
+  gfx_set(0.50, 0.53, 0.60, 1);
+  strcpy(#s, _f == 50 ? "50" : _f == 100 ? "100" : _f == 500 ? "500" : _f == 1000 ? "1k" : _f == 5000 ? "5k" : "10k");
+  text_c(#s, _xx - 20 * SC, dy + dh - 15 * SC, 40 * SC, 14 * SC);
+  _f = _f == 50 ? 100 : _f == 100 ? 500 : _f == 500 ? 1000 : _f == 1000 ? 5000 : 10000;
+);
+_d = 12; while (_d >= -24) (
+  gfx_set(1, 1, 1, _d == 0 ? 0.10 : 0.04); gfx_line(fx0, c2y(_d), fx0 + fw - 1, c2y(_d));
+  gfx_set(0.42, 0.45, 0.52, 1); sprintf(#s, "%+d", _d); _d == 0 ? strcpy(#s, "0");
+  text_r(#s, fx0, c2y(_d) - 12 * SC, fw - 4 * SC, 12 * SC);
+  _d -= 12;
+);
+// zona de graves en mono
+slider5 > 20.5 ? (
+  _xm = f2x(slider5);
+  gfx_set(0.55, 0.58, 0.66, 0.07); gfx_rect(fx0, dy + 18 * SC, _xm - fx0, dh - 34 * SC, 1);
+  fnt(4); gfx_set(0.62, 0.65, 0.72, 1); text_l("MONO", fx0 + 6 * SC, dy + dh - 30 * SC, 12 * SC);
+);
+// espectro en vivo de la salida: centro (relleno) y lados (linea)
+function spec(src, mag) local(i, j, v)
+(
+  i = 0; loop(2048, j = (spw - 2048 + i) & (SPN - 1); fftb[i] = src[j] * (0.5 - 0.5 * cos(2 * $pi * i / 2048)); i += 1; );
+  fft_real(fftb, 2048); fft_permute(fftb, 1024);
+  i = 1; loop(1023,
+    v = 10 * log10(fftb[2 * i] * fftb[2 * i] + fftb[2 * i + 1] * fftb[2 * i + 1] + 0.0000000001) - 54.2;
+    mag[i] = v > mag[i] ? v : mag[i] - 0.9;
+    i += 1;
+  );
+);
+function sp2y(v) ( dy + 18 * SC + (dh - 34 * SC) * clamp(-(v + 6) / 84, 0, 1) );
+function spval(mag, f) local(b, i, t) ( b = f / srate * 2048; i = floor(b); t = b - i; i < 1 ? mag[1] : mag[i] * (1 - t) + mag[i + 1] * t; );
+spec(spM, magM); spec(spS, magS);
+_n = floor(fw / SC); _c = 0;
+loop(_n + 1,
+  _xx = fx0 + _c * SC; _ff = x2f(_xx);
+  _ym = sp2y(spval(magM, _ff)); _ys = sp2y(spval(magS, _ff));
+  acc(0.10); gfx_line(_xx, _ym, _xx, dy + dh - 17 * SC);
+  _c > 0 ? ( acc(0.40); gfx_line(_pxx, _pym, _xx, _ym, 1); sid(0.55); gfx_line(_pxx, _pys, _xx, _ys, 1); );
+  _pxx = _xx; _pym = _ym; _pys = _ys; _c += 1;
+);
+// curvas: centro (hueco) y lados (ancho, lados, graves en mono); side sintetico punteado
+_gl = slider1 / 100 * db2a(slider9);
+_c = 0;
+loop(_n + 1,
+  _xx = fx0 + _c * SC; _ff = x2f(_xx);
+  _yt = c2y(20 * log10(pk_mag(_ff, slider7)));
+  _ya = c2y(20 * log10(pk_mag(_ff, gcur)));
+  _yl = c2y(20 * log10(_gl * mono_mag(_ff) + 0.0000001));
+  _yn = c2y(20 * log10(slider2 / 100 * _gl * syn_mag(_ff) * mono_mag(_ff) + 0.0000001));
+  _c > 0 ? (
+    slider2 > 0 && (_c & 3) < 2 ? ( sid(0.6); gfx_line(_pxx, _pyn, _xx, _yn, 1); );
+    sid(1); gfx_line(_pxx, _pyl, _xx, _yl, 1); gfx_line(_pxx, _pyl - 1, _xx, _yl - 1, 1);
+    slider7 < 0 && (_c & 3) < 2 ? ( gfx_set(1, 1, 1, 0.25); gfx_line(_pxx, _pyt, _xx, _yt, 1); );
+    acc(1); gfx_line(_pxx, _pya, _xx, _ya, 1); gfx_line(_pxx, _pya + 1, _xx, _ya + 1, 1);
+  );
+  _pxx = _xx; _pyt = _yt; _pya = _ya; _pyl = _yl; _pyn = _yn; _c += 1;
+);
+hit_add(fx0, dy, fw, dh, 101);
+// manijas: hueco, graves en mono, tono del side sintetico
+_h0 = hover_id == 110 || (drag && drag_id == 110);
+_hx = f2x(slider6); _hy = c2y(slider7);
+acc(_h0 ? 1 : 0.85); gfx_circle(_hx, _hy, (_h0 ? 7 : 6) * SC, 1, 1);
+gfx_set(0.07, 0.08, 0.10, 1); gfx_circle(_hx, _hy, 2.5 * SC, 1, 1);
+hit_add(_hx - 12 * SC, _hy - 12 * SC, 24 * SC, 24 * SC, 110);
+_h0 = hover_id == 111 || (drag && drag_id == 111);
+_xm = slider5 > 20.5 ? f2x(slider5) : fx0 + 3 * SC;
+gfx_set(0.80, 0.82, 0.88, _h0 ? 1 : slider5 > 20.5 ? 0.7 : 0.35);
+gfx_rect(_xm - SC, dy + 18 * SC, 2 * SC, dh - 34 * SC, 1); gfx_circle(_xm, dy + 26 * SC, 4 * SC, 1, 1);
+hit_add(_xm - 8 * SC, dy + 18 * SC, 16 * SC, dh - 34 * SC, 111);
+slider2 > 0 ? (
+  _h0 = hover_id == 112 || (drag && drag_id == 112);
+  _xs = f2x(slider4); sid(_h0 ? 1 : 0.6);
+  _yy = dy + 30 * SC; while (_yy < dy + dh - 18 * SC) ( gfx_rect(_xs - SC * 0.5, _yy, SC, 5 * SC, 1); _yy += 9 * SC; );
+  gfx_triangle(_xs - 4 * SC, dy + 20 * SC, _xs + 4 * SC, dy + 20 * SC, _xs, dy + 27 * SC);
+  hit_add(_xs - 7 * SC, dy + 18 * SC, 14 * SC, dh - 34 * SC, 112);
+);
+fnt(4); acc(1);
+fmt_f(#a, slider6);
+slider7 < 0 ? sprintf(#s, "CENTRO   hueco %s  %.1f dB  Q %.2f", #a, slider7, slider8) : strcpy(#s, "CENTRO   sin hueco");
+text_l(#s, fx0 + 6 * SC, dy + 3 * SC, 14 * SC);
+sid(1); sprintf(#s, "LADOS %d %%  %+.1f dB", slider1, slider9);
+slider2 > 0 ? ( sprintf(#a, "   + sintetico %d %%", slider2); strcat(#s, #a); );
+text_r(#s, fx0, dy + 3 * SC, fw - 6 * SC, 14 * SC);
+slider12 > 0 ? ( gfx_set(0.95, 0.85, 0.35, 1); sprintf(#s, "hueco y lados activos desde %.2f s", slider12); text_l(#s, fx0 + 6 * SC, dy + 17 * SC, 12 * SC); );
+(hover_id == 101 || (drag && drag_id == 101)) ? ( gfx_set(1, 1, 1, 0.25); gfx_rect(fx0, dy, fw, dh, 0); );
+
+// ---- medidores: correlacion entrada / salida y lados/centro
+_mt = dy + 18 * SC; _mh = dh - 36 * SC; _bw = 18 * SC;
+_k = 0;
+loop(3,
+  _xx = mx0 + 22 * SC + _k * 34 * SC;
+  gfx_set(0.13, 0.14, 0.18, 1); gfx_rect(_xx, _mt, _bw, _mh, 1);
+  _k < 2 ? (
+    _v = _k == 0 ? c_in : c_out; _vm = _k == 0 ? cmin_in : cmin_out;
+    _y0 = _mt + _mh * 0.5; _yv = _mt + _mh * (1 - (clamp(_v, -1, 1) + 1) * 0.5);
+    _v < 0 ? gfx_set(1.0, 0.45, 0.40, 1) : _v < 0.3 ? gfx_set(0.95, 0.85, 0.35, 1) : acc(1);
+    gfx_rect(_xx, min(_y0, _yv), _bw, max(abs(_yv - _y0), SC), 1);
+    gfx_set(1, 1, 1, 0.6); _yy = _mt + _mh * (1 - (clamp(_vm, -1, 1) + 1) * 0.5); gfx_line(_xx, _yy, _xx + _bw - 1, _yy);
+    gfx_set(1, 1, 1, 0.15); gfx_line(_xx, _y0, _xx + _bw - 1, _y0);
+    quiet ? strcpy(#s, "--") : sprintf(#s, "%+.2f", _v);
+  ) : (
+    _v = quiet ? -40 : sm_db(oLL, oRR, oLR);
+    _lv = clamp((_v + 30) / 36, 0, 1);
+    sid(1); gfx_rect(_xx, _mt + _mh * (1 - _lv), _bw, _mh * _lv, 1);
+    gfx_set(1, 1, 1, 0.15); _yy = _mt + _mh * (1 - 30 / 36); gfx_line(_xx, _yy, _xx + _bw - 1, _yy);
+    quiet ? strcpy(#s, "--") : sprintf(#s, "%.0f", _v);
+  );
+  fnt(4); gfx_set(0.80, 0.82, 0.88, 1); text_c(#s, _xx - 10 * SC, dy, _bw + 20 * SC, 16 * SC);
+  gfx_set(0.50, 0.53, 0.60, 1); text_c(_k == 0 ? "IN" : _k == 1 ? "OUT" : "S/M", _xx - 10 * SC, _mt + _mh + 2 * SC, _bw + 20 * SC, 16 * SC);
+  _k += 1;
+);
+fnt(4); gfx_set(0.42, 0.45, 0.52, 1);
+text_r("+1", mx0, _mt - 6 * SC, 18 * SC, 12 * SC); text_r("0", mx0, _mt + _mh * 0.5 - 6 * SC, 18 * SC, 12 * SC); text_r("-1", mx0, _mt + _mh - 6 * SC, 18 * SC, 12 * SC);
+hit_add(mx0, dy, MW, dh, 102);
+
+// ---- panel inferior
+gfx_set(0.10, 0.11, 0.14, 1); gfx_rect(0, py - 4 * SC, WW, WH - py + 4 * SC, 1);
+_x = 14 * SC; _y = py + 6 * SC; _h = 28 * SC;
+fnt(2); gfx_set(0.55, 0.58, 0.65, 1); text_l("ESCUCHAR", _x, _y, _h); _x += 62 * SC;
+seg(50, _x, _y, 70 * SC, _h, "Normal", slider14 == 0); _x += 74 * SC;
+seg(51, _x, _y, 70 * SC, _h, "Mono", slider14 == 1); _x += 74 * SC;
+seg(52, _x, _y, 90 * SC, _h, "Solo lados", slider14 == 2);
+_x = 432 * SC;
+fnt(2); gfx_set(0.55, 0.58, 0.65, 1); text_l("HUECO", _x, _y, _h); _x += 48 * SC;
+seg(40, _x, _y, 80 * SC, _h, "Siempre", slider10 == 0); _x += 84 * SC;
+seg(41, _x, _y, 110 * SC, _h, "Solo con voz", slider10 == 1);
+
+_ky = py + 92 * SC; _kr = 21 * SC; _kx = 46 * SC; _ks = 74 * SC;
+knob_side = 1;
+sprintf(#s, "%d %%", slider1); knob(1, _kx, _ky, _kr, "Ancho", #s, ctl_get(1), 2, 1); _kx += _ks;
+sprintf(#s, "%d %%", slider2); knob(2, _kx, _ky, _kr, "Side sint.", slider2 > 0 ? #s : "Apagado", ctl_get(2), 0, 1); _kx += _ks;
+sprintf(#s, "%.1f ms", slider3); knob(3, _kx, _ky, _kr, "Retardo", #s, ctl_get(3), 0, slider2 > 0); _kx += _ks;
+fmt_f(#s, slider4); knob(4, _kx, _ky, _kr, "Tono side", #s, ctl_get(4), 0, slider2 > 0); _kx += _ks;
+fmt_f(#s, slider5); knob(5, _kx, _ky, _kr, "Graves mono", slider5 > 20.5 ? #s : "Apagado", ctl_get(5), 0, 1); _kx += _ks;
+gfx_set(1, 1, 1, 0.06); gfx_line(_kx - 30 * SC, py + 46 * SC, _kx - 30 * SC, py + 136 * SC);
+_kx = 470 * SC;
+knob_side = 0;
+fmt_f(#s, slider6); knob(6, _kx, _ky, _kr, "Frecuencia", #s, ctl_get(6), 0, slider7 < 0); _kx += _ks;
+sprintf(#s, "%.1f dB", slider7); knob(7, _kx, _ky, _kr, "Cantidad", slider7 < 0 ? #s : "0 dB", ctl_get(7), 0, 1); _kx += _ks;
+sprintf(#s, "%.2f", slider8); knob(8, _kx, _ky, _kr, "Ancho (Q)", #s, ctl_get(8), 0, slider7 < 0); _kx += _ks;
+knob_side = 1;
+sprintf(#s, "%+.1f dB", slider9); knob(9, _kx, _ky, _kr, "Lados", abs(slider9) < 0.05 ? "0.0 dB" : #s, ctl_get(9), 1, 1); _kx += _ks;
+knob_side = 0;
+sprintf(#s, "%.0f dB", slider11); knob(11, _kx, _ky, _kr, "Umbral voz", #s, ctl_get(11), 0, slider10 == 1); _kx += _ks;
+gfx_set(1, 1, 1, 0.06); gfx_line(_kx - 30 * SC, py + 46 * SC, _kx - 30 * SC, py + 136 * SC);
+_kx = max(_kx + 6 * SC, WW - 50 * SC);
+sprintf(#s, "%+.1f dB", slider13); knob(13, _kx, _ky, _kr, "Salida", abs(slider13) < 0.05 ? "0.0 dB" : #s, ctl_get(13), 1, 1);
+
+// ---- pie: ayuda contextual
+hint_for(hover_id);
+gfx_set(0.06, 0.065, 0.085, 1); gfx_rect(0, WH - FOOTH, WW, FOOTH, 1);
+fnt(2); gfx_set(0.70, 0.73, 0.80, 1); text_l(#hint, 12 * SC, WH - FOOTH, FOOTH);
+slider14 == 1 ? ( acc(1); text_r("ESCUCHANDO EN MONO", WW - 260 * SC, WH - FOOTH, 248 * SC, FOOTH); )
+: slider14 == 2 ? ( sid(1); text_r("ESCUCHANDO SOLO LOS LADOS", WW - 260 * SC, WH - FOOTH, 248 * SC, FOOTH); );
