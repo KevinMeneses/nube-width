@@ -39,6 +39,7 @@ fftb = 25400; magM = 27600; magS = 28700;
 GN = 4096; gonL = 30000; gonR = 34200;  // goniometro
 hitmem = 38400;
 memset(0, 0, BUFN); memset(stMono, 0, 8);
+_i = 0; loop(1024, magM[_i] = magS[_i] = -120; _i += 1; );
 
 // ---------------------------------------------------------------- utilidades
 function clamp(x, a, b) ( x < a ? a : x > b ? b : x );
@@ -558,12 +559,13 @@ function spec(src, mag) local(i, j, v)
   fft_real(fftb, 2048); fft_permute(fftb, 1024);
   i = 1; loop(1023,
     v = 10 * log10(fftb[2 * i] * fftb[2 * i] + fftb[2 * i + 1] * fftb[2 * i + 1] + 0.0000000001) - 54.2;
-    mag[i] = v > mag[i] ? v : mag[i] - 0.9;
+    mag[i] = v > mag[i] ? v : mag[i] - sp_dec;
     i += 1;
   );
 );
 function sp2y(v) ( dy + 18 * SC + (dh - 34 * SC) * clamp(-(v + 6) / 84, 0, 1) );
 function spval(mag, f) local(b, i, t) ( b = f / srate * 2048; i = floor(b); t = b - i; i < 1 ? mag[1] : mag[i] * (1 - t) + mag[i + 1] * t; );
+_now = time_precise(); sp_dec = clamp((_now - sp_t) * 54, 0, 60); sp_t = _now;   // cae 54 dB/s aunque la ventana dibuje poco
 spec(spM, magM); spec(spS, magS);
 _n = floor(fw / SC); _c = 0;
 loop(_n + 1,
@@ -616,7 +618,7 @@ text_l(#s, fx0 + 6 * SC, dy + 3 * SC, 14 * SC);
 sid(1); sprintf(#s, "LADOS %d %%  %+.1f dB", slider1, slider9);
 slider2 > 0 ? ( sprintf(#a, "   + sintetico %d %%", slider2); strcat(#s, #a); );
 text_r(#s, fx0, dy + 3 * SC, fw - 6 * SC, 14 * SC);
-slider12 > 0 ? ( gfx_set(0.95, 0.85, 0.35, 1); sprintf(#s, "hueco y lados activos desde %.2f s", slider12); text_l(#s, fx0 + 6 * SC, dy + 17 * SC, 12 * SC); );
+slider12 > 0 ? ( gfx_set(0.95, 0.85, 0.35, 1); sprintf(#s, "hueco y lados activos desde %.2f s", slider12); text_l(#s, fx0 + 16 * SC, dy + 19 * SC, 12 * SC); );
 (hover_id == 101 || (drag && drag_id == 101)) ? ( gfx_set(1, 1, 1, 0.25); gfx_rect(fx0, dy, fw, dh, 0); );
 
 // ---- medidores: correlacion entrada / salida y lados/centro
